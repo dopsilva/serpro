@@ -1,0 +1,94 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+local t = require("sea/test")
+local http = require("http")
+local serpro = require("./serpro")
+
+-- a fake Serpro gateway on a free local port
+local function fake(calls)
+    local r = http.router()
+    r.post("/token", function(req)
+        calls.token += 1
+        if req.headers["authorization"] ~= "Basic " .. encoding.base64_encode("k:s") then
+            return http.json({error = "invalid_client"}, 401)
+        end
+        return http.json({access_token = "tok" .. calls.token, expires_in = 3600})
+    end)
+    r.get("/consulta-cpf-df/v1/cpf/:ni", function(req)
+        calls.get += 1
+        if req.headers["authorization"] ~= "Bearer tok" .. calls.token then
+            return http.json({mensagem = "expirado"}, 401)
+        end
+        if req.params["ni"] == "11144477735" then
+            return http.json({ni = "11144477735", nome = "FULANO", situacao = {codigo = "0", descricao = "Regular"}})
+        end
+        return http.json({mensagem = "CPF nao encontrado"}, 404)
+    end)
+    r.get("/consulta-cnpj-df/v2/:kind/:ni", function(req)
+        calls.get += 1
+        return http.json({ni = req.params["ni"], kind = req.params["kind"]})
+    end)
+    return t.no_error(http.listen(0, r))
+end
+
+t.describe("serpro: documentos", function()
+    t.it("valida CPF", function()
+        t.eq(serpro.valid_cpf("111.444.777-35"), true)
+        t.eq(serpro.valid_cpf("11144477736"), false)
+        t.eq(serpro.valid_cpf("111.111.111-11"), false)
+        t.eq(serpro.valid_cpf("123"), false)
+        t.eq(serpro.clean_cpf("111.444.777-35"), "11144477735")
+    end)
+
+    t.it("valida CNPJ numérico e alfanumérico", function()
+        t.eq(serpro.valid_cnpj("00.000.000/0001-91"), true)
+        t.eq(serpro.valid_cnpj("00.000.000/0001-92"), false)
+        t.eq(serpro.valid_cnpj("12.ABC.345/01DE-35"), true)
+        t.eq(serpro.valid_cnpj("12abc34501de35"), true)
+        t.eq(serpro.valid_cnpj("11.111.111/1111-11"), false)
+        t.eq(serpro.clean_cnpj("00.000.000/0001-91"), "00000000000191")
+    end)
+end)
+
+t.describe("serpro: cliente", function()
+    t.it("pede o token, consulta o CPF e o CNPJ", function()
+        local calls = {token = 0, get = 0}
+        local srv = fake(calls)
+        local c = serpro.new({key = "k", secret = "s", base_url = `http://127.0.0.1:${srv.port}`})
+        local p = c:cpf("111.444.777-35")
+        t.eq(p.nome, "FULANO")
+        t.eq(p.situacao.descricao, "Regular")
+        local e = c:cnpj("00.000.000/0001-91", "qsa")
+        t.eq(e.kind, "qsa")
+        t.eq(e.ni, "00000000000191")
+        t.eq(calls.token, 1)   -- the token is reused
+        srv.close()
+    end)
+
+    t.it("devolve erro para documento inválido, 404 e credenciais erradas", function()
+        local calls = {token = 0, get = 0}
+        local srv = fake(calls)
+        local base = `http://127.0.0.1:${srv.port}`
+        local c = serpro.new({key = "k", secret = "s", base_url = base})
+        t.is_error(c:cpf("123"), "CPF inválido")
+        t.is_error(c:cnpj("00000000000191", "x"), "tipo de consulta")
+        t.is_error(c:cpf("529.982.247-25"), "404")
+        t.eq(calls.get, 1)
+        local bad = serpro.new({key = "k", secret = "wrong", base_url = base})
+        t.is_error(bad:cpf("111.444.777-35"), "401")
+        t.is_error(serpro.new({base_url = base}):cpf("111.444.777-35"), "key e secret")
+        srv.close()
+    end)
+
+    t.it("renova o token quando o servidor responde 401", function()
+        local calls = {token = 0, get = 0}
+        local srv = fake(calls)
+        local c = serpro.new({key = "k", secret = "s", base_url = `http://127.0.0.1:${srv.port}`})
+        t.eq(c:cpf("11144477735").nome, "FULANO")
+        calls.token = 5   -- the server now wants a token other than the cached "tok1"
+        local p = c:cpf("11144477735")
+        t.eq(p.nome, "FULANO")
+        srv.close()
+    end)
+end)
